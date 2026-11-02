@@ -158,7 +158,15 @@ DIST=-- cm (invalid / out of range)
 ...
 ```
 
-## 8. 文件清单
+## 8. 硬件设计（嘉立创EDA）
+
+本工程包含由**嘉立创EDA（立创EDA）**设计的原理图与 PCB 工程文件：
+
+| 文件 | 说明 |
+|---|---|
+| 雷达测距仪_2026-11-02.epro2 | 嘉立创EDA 工程文件（原理图 + PCB，约 250KB），可用嘉立创EDA 客户端/网页版导入查看与编辑 |
+
+## 9. 文件清单
 
 | 文件 | 说明 |
 |---|---|
@@ -169,8 +177,9 @@ DIST=-- cm (invalid / out of range)
 | beep.h / .c | 硬件 BEEP 驱动（PD4，LSI 1/2/4kHz，定时自动关断），取自 project1 |
 | Makefile / build.bat | SDCC 构建脚本（编译 -> 链接 -> packihx 出 hex） |
 | README.md | 本文档 |
+| 雷达测距仪_2026-11-02.epro2 | 嘉立创EDA 原理图 + PCB 工程（可用嘉立创EDA 导入查看/编辑） |
 
-## 9. 编译与烧录
+## 10. 编译与烧录
 
 ```bat
 cd D:\stm8s_project\project5
