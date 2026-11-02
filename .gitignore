@@ -1,0 +1,30 @@
+# STM8S103 工程通用忽略规则
+
+# --- 临时文件 ---
+temp/
+
+# --- 编译二进制结果文件 ---
+*.hex
+*.ihx
+*.lk
+*.lst
+*.map
+*.sym
+*.cdb
+*.asm
+*.rel
+*.rst
+*.mem
+*.o
+*.elf
+*.obj
+*.bin
+build/
+Debug/
+Release/
+
+# --- 隐藏文件：点开头的目录（如 .vscode），保留 .gitignore 自身 ---
+.[^.]*/
+
+# --- 设计/工程二进制文件（如立创EDA .epro2），不提交 ---
+*.epro2
