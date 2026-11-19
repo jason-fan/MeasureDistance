@@ -21,7 +21,6 @@ set REL3=segled.rel
 set REL4=uart.rel
 set REL5=beep.rel
 set OUTPUT=%PROJECT%.ihx
-set HEX=%PROJECT%.hex
 
 echo.
 echo ========================================
@@ -80,24 +79,12 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo [ OK ] Compilation successful.
 
-REM ====== Generate Intel HEX ======
-if exist "%OUTPUT%" (
-    echo [STEP] Generating Intel HEX...
-    packihx "%OUTPUT%" > "%HEX%"
-    if exist "%HEX%" (
-        echo [ OK ] HEX file generated: %HEX%
-    ) else (
-        echo [WARN] packihx may have failed. HEX not generated.
-    )
-)
-
 REM ====== Summary ======
 echo.
 echo ========================================
 echo   Build Summary
 echo ========================================
 if exist "%OUTPUT%" echo   %OUTPUT%  -  IHX output
-if exist "%HEX%"    echo   %HEX%     -  Intel HEX file
 if exist "%PROJECT%.lk"   echo   %PROJECT%.lk    -  linker script
 if exist "%PROJECT%.map"  echo   %PROJECT%.map   -  memory map
 if exist "%PROJECT%.lst"  echo   %PROJECT%.lst   -  assembly listing

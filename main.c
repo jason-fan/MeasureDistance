@@ -35,16 +35,21 @@
  *   invalid reading.
  *   The result is printed over UART (the REAL echo width is always
  *   printed, e.g. "DIST=-- cm (OVR>=1m, us=25523)"); beep policy uses
- *   two escalating warning bands (2kHz 50ms each), so the distance can
- *   be judged by ear alone:
- *     - < HCSR04_CRIT_MM (10cm)  -> ALARM: one beep per
+ *   three escalating warning bands (50ms each, pitch AND cadence rising
+ *   as the target approaches), so the distance can be judged by ear
+ *   alone:
+ *     - < HCSR04_CRIT_MM (20cm)  -> 4kHz ALARM: one beep per
  *       HCSR04_CRIT_BEEP_EVERY (2) accepted readings
  *       (200ms cadence, ~5Hz);
- *     - < HCSR04_NEAR_MM (20cm)  -> one beep per HCSR04_NEAR_BEEP_EVERY
- *       (4) accepted readings (400ms cadence, ~2.5Hz);
- *     - NO beep for >= 20cm, >= 1m, suppressed or rejected readings,
- *       and invalid / no echo. Both counters are cleared whenever a
- *       reading is >= 20cm or invalid.
+ *     - < HCSR04_NEAR_MM (50cm)  -> 2kHz: one beep per
+ *       HCSR04_NEAR_BEEP_EVERY (4) accepted readings
+ *       (400ms cadence, ~2.5Hz);
+ *     - < HCSR04_FAR_MM (80cm)   -> 1kHz: one beep per
+ *       HCSR04_FAR_BEEP_EVERY (6) accepted readings
+ *       (600ms cadence, ~1.67Hz);
+ *     - NO beep for >= 80cm, >= 1m, suppressed or rejected readings,
+ *       and invalid / no echo. All three counters are cleared whenever a
+ *       reading is >= 80cm or invalid.
  *
  * Filter chain (CURRENTLY ACTIVE - see hcsr04_handle_done):
  *   Three stages used to be cascaded here: a median window, a 300mm
@@ -271,28 +276,39 @@
  * echo width is still printed over UART for diagnostics. */
 #define DIST_DISPLAY_MAX_MM        1000  /* display range: < 1m only */
 
-/* ========== Near-Range Beep Escalation (two warning bands) ==========
+/* ========== Near-Range Beep Escalation (three warning bands) ==========
  * The beeper has to tell a CONTINUOUS close-range alarm apart from a
  * plain proximity warning, without the operator looking at the panel.
- * Two bands are used, both 2kHz / 50ms, and BOTH are throttled by an
- * accepted-reading counter because the cycle period is now 100ms - a
- * beep on every cycle would be 10Hz, i.e. the 50ms pulses would merge
- * into a continuous softer tone instead of a chirp:
- *   < HCSR04_CRIT_MM (10cm) -> one beep every HCSR04_CRIT_BEEP_EVERY (2)
- *      accepted readings = once per 200ms: a fast ~5Hz chirp,
- *      unmistakable alarm;
- *   < HCSR04_NEAR_MM (20cm) -> one beep every HCSR04_NEAR_BEEP_EVERY (4)
- *      accepted readings = once per 400ms: audible but not frantic;
- *   >= 20cm up to the 1m display limit -> silent (the display still
+ * Three bands are used now: the pitch rises AND the cadence quickens as
+ * the target approaches, so tone and rhythm both carry the same message
+ * (the BEEP hardware offers exactly 1 / 2 / 4 kHz, which maps cleanly
+ * onto three bands):
+ *   < HCSR04_CRIT_MM (20cm) -> HCSR04_CRIT_KHZ (4kHz), one beep every
+ *      HCSR04_CRIT_BEEP_EVERY (2) accepted readings = 200ms / 5Hz:
+ *      a fast, high-pitched chirp, unmistakable alarm;
+ *   < HCSR04_NEAR_MM (50cm) -> HCSR04_NEAR_KHZ (2kHz), one beep every
+ *      HCSR04_NEAR_BEEP_EVERY (4) accepted readings = 400ms / 2.5Hz;
+ *   < HCSR04_FAR_MM (80cm)  -> HCSR04_FAR_KHZ (1kHz), one beep every
+ *      HCSR04_FAR_BEEP_EVERY (6) accepted readings = 600ms / 1.67Hz;
+ *   >= 80cm up to the 1m display limit -> silent (the display still
  *      shows the distance).
- * Each band owns its own counter and both are cleared as soon as the
- * reading leaves the band or turns invalid, so a partial count can never
- * spill over into a later approach - and the 5Hz alarm cadence can never
- * inherit a half-filled 2.5Hz warning counter. */
-#define HCSR04_CRIT_MM              100  /* < 10cm: alarm band */
-#define HCSR04_CRIT_BEEP_EVERY        2  /* beep per 2 reads -> 200ms/5Hz */
-#define HCSR04_NEAR_MM              200  /* < 20cm: throttled warning */
+ * All beeps are 50ms, and every band is throttled by an accepted-reading
+ * counter because the cycle period is 100ms - a beep on every cycle
+ * would be 10Hz and the 50ms pulses would merge into a continuous softer
+ * tone instead of a chirp.
+ * Each band owns its own counter and the other two are cleared the
+ * moment the reading enters a band, so a partial count can never spill
+ * over into a later approach - and the 5Hz alarm cadence can never
+ * inherit a half-filled 1.67Hz reminder counter. */
+#define HCSR04_CRIT_MM              200  /* < 20cm: urgent alarm band       */
+#define HCSR04_CRIT_BEEP_EVERY        2  /* beep per 2 reads -> 200ms / 5Hz */
+#define HCSR04_CRIT_KHZ               4  /* 4kHz: highest pitch             */
+#define HCSR04_NEAR_MM              500  /* < 50cm: warning band            */
 #define HCSR04_NEAR_BEEP_EVERY        4  /* beep per 4 reads -> 400ms/2.5Hz */
+#define HCSR04_NEAR_KHZ               2  /* 2kHz                            */
+#define HCSR04_FAR_MM               800  /* < 80cm: reminder band           */
+#define HCSR04_FAR_BEEP_EVERY         6  /* beep per 6 reads -> 600ms/1.67Hz*/
+#define HCSR04_FAR_KHZ                1  /* 1kHz: lowest, gentlest          */
 
 /* ========== STM8S103 Register Definitions ========== */
 
@@ -762,19 +778,22 @@ static uint8_t display_update(uint16_t v)
 /* ========== Handle One Finished HC-SR04 Cycle ==========
  * Called from the main loop exactly once when service() returns
  * HCSR04_DONE. Updates the display, prints the result over UART and
- * plays the configured beep in one of two escalating bands. Both bands
+ * plays the configured beep in one of three escalating bands. All bands
  * count ACCEPTED readings, because one cycle is only 100ms:
- *   alarm      -> accepted reading < 10cm (HCSR04_CRIT_MM): one beep
- *                 every HCSR04_CRIT_BEEP_EVERY (2) accepted readings,
- *                 i.e. 200ms / 5Hz; its counter is cleared whenever the
- *                 reading leaves the band, so a retreat into the 10-20cm
- *                 band starts counting from scratch
- *   throttled  -> accepted reading < 20cm (HCSR04_NEAR_MM): one beep
- *                 every HCSR04_NEAR_BEEP_EVERY (4) accepted readings,
- *                 counter then restarts from 0 (400ms / 2.5Hz cadence)
- *   (no beep)  -> >= 20cm, >= 1m, suppressed / rejected readings,
- *                 invalid or no echo (both counters cleared on >= 20cm
- *                 and on invalid samples) */
+ *   alarm      -> accepted reading < 20cm (HCSR04_CRIT_MM): 4kHz, one
+ *                 beep every HCSR04_CRIT_BEEP_EVERY (2) accepted
+ *                 readings, i.e. 200ms / 5Hz; the lower-band counters are
+ *                 pinned to 0, so a retreat into the 20-50cm band starts
+ *                 counting from scratch
+ *   warning    -> accepted reading < 50cm (HCSR04_NEAR_MM): 2kHz, one
+ *                 beep every HCSR04_NEAR_BEEP_EVERY (4) accepted
+ *                 readings, counter then restarts from 0 (400ms/2.5Hz)
+ *   reminder   -> accepted reading < 80cm (HCSR04_FAR_MM): 1kHz, one
+ *                 beep every HCSR04_FAR_BEEP_EVERY (6) accepted
+ *                 readings, counter then restarts from 0 (600ms/1.67Hz)
+ *   (no beep)  -> >= 80cm, >= 1m, suppressed / rejected readings,
+ *                 invalid or no echo (all three counters cleared on
+ *                 >= 80cm and on invalid samples) */
 static void hcsr04_handle_done(void)
 {
     /* NOTE: the raw echo width (hcsr04.last_echo_us) is deliberately NOT
@@ -784,6 +803,7 @@ static void hcsr04_handle_done(void)
      * the 40ms WAIT_LOW timeout, < 65536). */
     /* Beep throttle counters, one per warning band: only meaningful for
      * accepted readings inside the display range. Held across calls. */
+    static uint8_t far_beep_cnt = 0;
     static uint8_t near_beep_cnt = 0;
     static uint8_t crit_beep_cnt = 0;
     /* UART log divider: 0 = this cycle prints, see HCSR04_UART_EVERY_N. */
@@ -825,7 +845,8 @@ static void hcsr04_handle_done(void)
                 log_blank("OVR");       /* one line per entry into "--" */
                 printed_mm = 0xFFFE;
             }
-            near_beep_cnt = 0;          /* >= 1m: silent, drop the counters */
+            far_beep_cnt = 0;           /* >= 1m: silent, drop all counters */
+            near_beep_cnt = 0;
             crit_beep_cnt = 0;
             dist_filter_reset();
             median_reset();
@@ -880,37 +901,52 @@ static void hcsr04_handle_done(void)
 
         /* Beep policy keyed on the value the panel actually shows, so
          * the beep and the display always agree. One cycle is 100ms, so
-         * BOTH bands are throttled by their own counter (a beep on every
-         * cycle would be 10Hz and the 50ms pulses would merge into a
-         * continuous tone):
-         *   <  HCSR04_CRIT_MM (10cm) -> ALARM, one beep per
+         * ALL THREE bands are throttled by their own counter (a beep on
+         * every cycle would be 10Hz and the 50ms pulses would merge into
+         * a continuous tone). Pitch and cadence both escalate:
+         *   <  HCSR04_CRIT_MM (20cm) -> 4kHz ALARM, one beep per
          *      HCSR04_CRIT_BEEP_EVERY (2) readings = 200ms / 5Hz. The
-         *      near counter is pinned to 0 so a retreat into the 10-20cm
-         *      band restarts from scratch;
-         *   <  HCSR04_NEAR_MM (20cm) -> throttled, one beep per
+         *      two lower counters are pinned to 0 so a retreat into the
+         *      20-50cm band restarts from scratch;
+         *   <  HCSR04_NEAR_MM (50cm) -> 2kHz warning, one beep per
          *      HCSR04_NEAR_BEEP_EVERY (4) readings = 400ms / 2.5Hz;
-         *   >= HCSR04_NEAR_MM (20cm) -> never beeps, both counters are
+         *   <  HCSR04_FAR_MM (80cm) -> 1kHz reminder, one beep per
+         *      HCSR04_FAR_BEEP_EVERY (6) readings = 600ms / 1.67Hz;
+         *   >= HCSR04_FAR_MM (80cm) -> never beeps, all counters are
          *      cleared so a later close approach starts from 0. */
         if (shown_mm < HCSR04_CRIT_MM) {
             near_beep_cnt = 0;          /* pin: alarm has priority */
+            far_beep_cnt  = 0;
             if (crit_beep_cnt < HCSR04_CRIT_BEEP_EVERY) {
                 crit_beep_cnt++;
             }
             if (crit_beep_cnt >= HCSR04_CRIT_BEEP_EVERY) {
                 crit_beep_cnt = 0;
-                beep.once(&beep, 2, 50);
+                beep.once(&beep, HCSR04_CRIT_KHZ, 50);
             }
         } else if (shown_mm < HCSR04_NEAR_MM) {
             crit_beep_cnt = 0;
+            far_beep_cnt  = 0;
             if (near_beep_cnt < HCSR04_NEAR_BEEP_EVERY) {
                 near_beep_cnt++;
             }
             if (near_beep_cnt >= HCSR04_NEAR_BEEP_EVERY) {
                 near_beep_cnt = 0;
-                beep.once(&beep, 2, 50);
+                beep.once(&beep, HCSR04_NEAR_KHZ, 50);
+            }
+        } else if (shown_mm < HCSR04_FAR_MM) {
+            crit_beep_cnt = 0;
+            near_beep_cnt = 0;
+            if (far_beep_cnt < HCSR04_FAR_BEEP_EVERY) {
+                far_beep_cnt++;
+            }
+            if (far_beep_cnt >= HCSR04_FAR_BEEP_EVERY) {
+                far_beep_cnt = 0;
+                beep.once(&beep, HCSR04_FAR_KHZ, 50);
             }
         } else {
-            near_beep_cnt = 0;      /* >= 20cm: silent */
+            far_beep_cnt  = 0;      /* >= 80cm: silent */
+            near_beep_cnt = 0;
             crit_beep_cnt = 0;
         }
     } else {
@@ -919,10 +955,11 @@ static void hcsr04_handle_done(void)
             log_blank("NOECHO");          /* one line per entry into "--" */
             printed_mm = 0xFFFE;
         }
-        /* invalid / no echo: do NOT beep, and drop BOTH band counters
+        /* invalid / no echo: do NOT beep, and drop ALL THREE band counters
          * so a stale partial count can never trigger later.
          * The median window and the panel value are dropped too, so a
          * long drop-out cannot drag the next real reading around. */
+        far_beep_cnt  = 0;
         near_beep_cnt = 0;
         crit_beep_cnt = 0;
         median_reset();

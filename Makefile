@@ -20,7 +20,6 @@ CFLAGS   = -mstm8 --std-c99 -I./
 
 # Output files
 IHX      = $(PROJECT).ihx
-HEX      = $(PROJECT).hex
 LST      = $(PROJECT).lst
 MAP      = $(PROJECT).map
 CDB      = $(PROJECT).cdb
@@ -41,10 +40,6 @@ $(IHX): $(SRCS)
 	$(CC) $(CFLAGS) -c beep.c
 	$(CC) $(CFLAGS) main.rel hcsr04.rel segled.rel uart.rel beep.rel -o $@
 
-# Generate Intel HEX from IHX
-hex: $(IHX)
-	packihx $(IHX) > $(HEX)
-
 # Show memory usage
 size: $(IHX)
 	@echo "----------------------------------------"
@@ -63,13 +58,12 @@ flash_uart: $(IHX)
 
 # Clean build artifacts
 clean:
-	rm -f *.ihx *.hex *.lk *.lst *.map *.sym *.cdb *.asm *.rel *.rst
+	rm -f *.ihx *.lk *.lst *.map *.sym *.cdb *.asm *.rel *.rst
 
 # Show help
 help:
 	@echo "Available targets:"
 	@echo "  all         Build the project (default)"
-	@echo "  hex         Generate Intel HEX file"
 	@echo "  size        Show memory usage info"
 	@echo "  flash       Flash via ST-LINK/V2 (stm8flash)"
 	@echo "  flash_uart  Flash via UART bootloader (stm8gal)"
