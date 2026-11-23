@@ -17,7 +17,7 @@
  *             PD0 not brought out on TSSOP20; PD1 shared with SWIM
  *             kept free for debug)
  *   UART     PD5 TX / PD6 RX, 115200 8N1 debug output
- *   CTRL     PD4 (plain GPIO push-pull output, idle HIGH, LOW pulse on trigger)
+ *   CTRL     PD4 (plain GPIO push-pull output, idle LOW, HIGH pulse on trigger)
  *
  * Display behaviour (internal precision = MILLIMETRES, display in cm):
  *   Every HCSR04_PERIOD_MS (100ms) the main loop starts a new
@@ -36,15 +36,15 @@
  *   The result is printed over UART as "SHOW <panel> | <mm>", tagged
  *   OVR / NOECHO when the panel is showing "--".
  *   Control output (PD4, replaces the old BEEP alarm): the pin idles
- *   HIGH. When an accepted reading is closer than CTRL_TRIGGER_MM
- *   (80cm) the pin is driven LOW for CTRL_PULSE_MS (200ms), released
- *   back HIGH, and further pulses are then blocked for CTRL_SILENCE_MS
- *   (8s), so one approach produces exactly one pulse. Measuring, the
- *   panel and the UART log are NOT suspended by that window: the board
- *   keeps displaying normally so it never looks dead. When the silence
- *   expires the detector is armed again:
+ *   LOW (INVERTED polarity). When an accepted reading is closer than
+ *   CTRL_TRIGGER_MM (80cm) the pin is driven HIGH for CTRL_PULSE_MS
+ *   (200ms), released back LOW, and further pulses are blocked for
+ *   CTRL_SILENCE_MS (8s), so one approach produces exactly one pulse.
+ *   Measuring, the panel and the UART log are NOT suspended by that
+ *   window: the board keeps displaying normally, never looking dead.
+ *   When the silence expires the detector is armed again:
  *     - >= 80cm, >= 1m, suppressed or rejected readings, and invalid /
- *       no echo -> pin stays HIGH, nothing is triggered.
+ *       no echo -> pin stays LOW, nothing is triggered.
  *
  * Filter chain (CURRENTLY ACTIVE - see hcsr04_handle_done):
  *   Three stages used to be cascaded here: a median window, a 300mm
@@ -275,9 +275,9 @@
  * plain push-pull GPIO output (BEEPEN stays 0 in its reset state, so the
  * alternate function never takes the pin over) and drives an external
  * device:
- *   - init / power-up      -> pin driven HIGH (idle, "nothing detected");
- *   - accepted reading < CTRL_TRIGGER_MM (80cm) -> pin LOW, ONCE;
- *   - after CTRL_PULSE_MS (200ms) the pin returns HIGH and no further
+ *   - init / power-up      -> pin driven LOW (idle, "nothing detected");
+ *   - accepted reading < CTRL_TRIGGER_MM (80cm) -> pin HIGH, ONCE;
+ *   - after CTRL_PULSE_MS (200ms) the pin returns LOW and no further
  *     pulse can fire for CTRL_SILENCE_MS (8s). Measurement, display and
  *     the UART log keep running through that window - only the output is
  *     muted, so panel / console never freeze;
@@ -287,8 +287,8 @@
  * 5mm rounding), so a single spike can never fire the output. Both the
  * pulse width and the silence window are timed from g_tick, i.e. they
  * never block the main loop and keep running while the loop is in wfi. */
-#define CTRL_TRIGGER_MM      800  /* < 80cm: one LOW pulse            */
-#define CTRL_PULSE_MS        200  /* LOW pulse width (ms)             */
+#define CTRL_TRIGGER_MM      800  /* < 80cm: one HIGH pulse           */
+#define CTRL_PULSE_MS        200  /* HIGH pulse width (ms)            */
 #define CTRL_SILENCE_MS     8000  /* quiet time after the pulse (ms)  */
 
 /* ========== STM8S103 Register Definitions ========== */
@@ -317,9 +317,9 @@ volatile uint16_t g_tick = 0;
 /* ========== Control Output (PD4) State ==========
  * Three phases, all timed from g_tick (1ms), so neither the pulse nor the
  * silence window blocks the main loop:
- *   CTRL_IDLE    -> pin HIGH, a close reading may fire the output
- *   CTRL_PULSE   -> pin LOW, pulse width counting down
- *   CTRL_SILENCE -> pin HIGH, new pulses refused (re-armed on exit)
+ *   CTRL_IDLE    -> pin LOW (idle level), a close reading may fire output
+ *   CTRL_PULSE   -> pin HIGH, pulse width counting down
+ *   CTRL_SILENCE -> pin LOW, new pulses refused (re-armed on exit)
  * Measurement, display and UART are intentionally NOT gated by this
  * state machine: only the PD4 output is, so the board keeps showing the
  * live distance during the 8s window instead of looking hung.
@@ -342,9 +342,10 @@ static uint16_t ctrl_tick  = 0;   /* g_tick at the start of the phase */
 
 static void ctrl_init(void)
 {
-    /* Latch the idle level BEFORE the pin becomes an output, so the
-     * external device never sees a spurious LOW at power-up. */
-    PD_ODR |= PD4_MASK;
+    /* Latch the idle level (LOW, inverted drive) BEFORE the pin becomes
+     * an output, so the external device never sees a spurious HIGH at
+     * power-up. */
+    PD_ODR &= (uint8_t)~PD4_MASK;
     PD_DDR |= PD4_MASK;              /* push-pull output */
     PD_CR1 |= PD4_MASK;
     PD_CR2 &= (uint8_t)~PD4_MASK;    /* no external interrupt */
@@ -361,7 +362,7 @@ static void ctrl_trigger(void)
     if (ctrl_state != CTRL_IDLE) {
         return;
     }
-    PD_ODR &= (uint8_t)~PD4_MASK;    /* LOW: drive the external device */
+    PD_ODR |= PD4_MASK;              /* HIGH: drive the external device */
     ctrl_tick  = g_tick;
     ctrl_state = CTRL_PULSE;
 }
@@ -372,7 +373,7 @@ static void ctrl_service(void)
 {
     if (ctrl_state == CTRL_PULSE) {
         if ((uint16_t)(g_tick - ctrl_tick) >= CTRL_PULSE_MS) {
-            PD_ODR |= PD4_MASK;      /* pulse over: back to idle HIGH */
+            PD_ODR &= (uint8_t)~PD4_MASK; /* pulse over: back to idle LOW */
             ctrl_tick  = g_tick;
             ctrl_state = CTRL_SILENCE;
         }
@@ -828,11 +829,11 @@ static uint8_t display_update(uint16_t v)
  * HCSR04_DONE. Updates the display, prints the result over UART and
  * fires the control output when the target is close:
  *   trigger    -> accepted reading < CTRL_TRIGGER_MM (80cm): PD4 goes
- *                 LOW for CTRL_PULSE_MS (200ms), then no pulse may fire
+ *                 HIGH for CTRL_PULSE_MS (200ms), then no pulse may fire
  *                 for CTRL_SILENCE_MS (8s). Display / UART keep updating
  *                 throughout. One approach = one pulse.
  *   (no pulse) -> >= 80cm, >= 1m, suppressed / rejected readings,
- *                 invalid or no echo: the pin stays HIGH. */
+ *                 invalid or no echo: the pin stays LOW. */
 static void hcsr04_handle_done(void)
 {
     /* NOTE: the raw echo width (hcsr04.last_echo_us) is deliberately NOT
@@ -946,7 +947,7 @@ static void hcsr04_handle_done(void)
             printed_mm = 0xFFFE;
         }
         /* invalid / no echo: no trigger. The control pin is left alone
-         * (it stays HIGH unless a pulse is already in flight).
+         * (it stays LOW unless a pulse is already in flight).
          * The median window and the panel value are dropped as well,
          * so a long drop-out cannot drag the next real reading. */
         median_reset();
@@ -1019,7 +1020,7 @@ int main(void)
     uart.init(&uart);           /* UART1 115200 8N1, TX PD5 / RX PD6 */
     seg.init(&seg);             /* 10 GPIO outputs for 2x7-seg (common-anode) */
     hcsr04.init(&hcsr04);       /* PB5=Trig out (open-drain+10k pull), PB4=Echo in */
-    ctrl_init();                /* PD4 push-pull output, idle HIGH */
+    ctrl_init();                /* PD4 push-pull output, idle LOW */
 
     tim1_setup();               /* TIM1: free-running 1us timebase, no IRQ */
     tim2_setup();               /* TIM2: 1ms slice (scan/g_tick) */
