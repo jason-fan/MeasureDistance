@@ -37,13 +37,13 @@
  *   OVR / NOECHO when the panel is showing "--".
  *   Control output (PD4, replaces the old BEEP alarm): the pin idles
  *   LOW (INVERTED polarity). When an accepted reading is closer than
- *   CTRL_TRIGGER_MM (80cm) the pin is driven HIGH for CTRL_PULSE_MS
+ *   CTRL_TRIGGER_MM (70cm) the pin is driven HIGH for CTRL_PULSE_MS
  *   (200ms), released back LOW, and further pulses are blocked for
  *   CTRL_SILENCE_MS (8s), so one approach produces exactly one pulse.
  *   Measuring, the panel and the UART log are NOT suspended by that
  *   window: the board keeps displaying normally, never looking dead.
  *   When the silence expires the detector is armed again:
- *     - >= 80cm, >= 1m, suppressed or rejected readings, and invalid /
+ *     - >= 70cm, >= 1m, suppressed or rejected readings, and invalid /
  *       no echo -> pin stays LOW, nothing is triggered.
  *
  * Filter chain (CURRENTLY ACTIVE - see hcsr04_handle_done):
@@ -276,7 +276,7 @@
  * alternate function never takes the pin over) and drives an external
  * device:
  *   - init / power-up      -> pin driven LOW (idle, "nothing detected");
- *   - accepted reading < CTRL_TRIGGER_MM (80cm) -> pin HIGH, ONCE;
+ *   - accepted reading < CTRL_TRIGGER_MM (70cm) -> pin HIGH, ONCE;
  *   - after CTRL_PULSE_MS (200ms) the pin returns LOW and no further
  *     pulse can fire for CTRL_SILENCE_MS (8s). Measurement, display and
  *     the UART log keep running through that window - only the output is
@@ -287,7 +287,7 @@
  * 5mm rounding), so a single spike can never fire the output. Both the
  * pulse width and the silence window are timed from g_tick, i.e. they
  * never block the main loop and keep running while the loop is in wfi. */
-#define CTRL_TRIGGER_MM      800  /* < 80cm: one HIGH pulse           */
+#define CTRL_TRIGGER_MM      700  /* < 70cm: one HIGH pulse           */
 #define CTRL_PULSE_MS        200  /* HIGH pulse width (ms)            */
 #define CTRL_SILENCE_MS     8000  /* quiet time after the pulse (ms)  */
 
@@ -356,8 +356,9 @@ static void ctrl_init(void)
 /* Fire one pulse. Called from hcsr04_handle_done() for an accepted
  * reading closer than CTRL_TRIGGER_MM. Refused while a pulse or the
  * following silence is still running, so one approach cannot produce a
- * second pulse. */
-static void ctrl_trigger(void)
+ * second pulse. Every accepted pulse also emits one UART line, so the
+ * serial log and the pin always agree. */
+static void ctrl_trigger(uint16_t mm)
 {
     if (ctrl_state != CTRL_IDLE) {
         return;
@@ -365,6 +366,7 @@ static void ctrl_trigger(void)
     PD_ODR |= PD4_MASK;              /* HIGH: drive the external device */
     ctrl_tick  = g_tick;
     ctrl_state = CTRL_PULSE;
+    uart.printf(&uart, "CTRL ON | %u mm\r\n", (unsigned int)mm);
 }
 
 /* Advance the pulse / silence phases. Called once per main-loop pass;
@@ -828,11 +830,11 @@ static uint8_t display_update(uint16_t v)
  * Called from the main loop exactly once when service() returns
  * HCSR04_DONE. Updates the display, prints the result over UART and
  * fires the control output when the target is close:
- *   trigger    -> accepted reading < CTRL_TRIGGER_MM (80cm): PD4 goes
+ *   trigger    -> accepted reading < CTRL_TRIGGER_MM (70cm): PD4 goes
  *                 HIGH for CTRL_PULSE_MS (200ms), then no pulse may fire
  *                 for CTRL_SILENCE_MS (8s). Display / UART keep updating
  *                 throughout. One approach = one pulse.
- *   (no pulse) -> >= 80cm, >= 1m, suppressed / rejected readings,
+ *   (no pulse) -> >= 70cm, >= 1m, suppressed / rejected readings,
  *                 invalid or no echo: the pin stays LOW. */
 static void hcsr04_handle_done(void)
 {
@@ -938,7 +940,7 @@ static void hcsr04_handle_done(void)
          * a pulse or the following 8s silence is running - one approach
          * yields exactly one pulse. */
         if (shown_mm < CTRL_TRIGGER_MM) {
-            ctrl_trigger();
+            ctrl_trigger(shown_mm);
         }
     } else {
         seg_show_distance(0xFFFF);        /* "--" (invalid) */
@@ -1041,7 +1043,7 @@ int main(void)
     uart.tx_service(&uart);
     uart.puts(&uart, "Log: one line per >=5mm change: SHOW <panel> | <mm>\r\n");
     uart.tx_service(&uart);
-    uart.puts(&uart, "Ctrl: PD4 idle high, <80cm -> low 200ms, silence 8s\r\n");
+    uart.puts(&uart, "Ctrl: PD4 idle low (inverted), <70cm -> high 200ms, silence 8s\r\n");
     uart.tx_service(&uart);
 
     /* Event-driven main loop.
