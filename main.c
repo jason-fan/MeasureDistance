@@ -13,11 +13,11 @@
  *            (common-ANODE, active-low segment, 2 digits)
  *            digits 1..2      -> PD2 PD3 (common anode, active high)
  *            (10 GPIO total; HC-SR04 occupies PB4/PB5 (former I2C
- *             pins, I2C not used), UART PD5/PD6 and BEEP PD4 avoided;
+ *             pins, I2C not used), UART PD5/PD6 and CTRL PD4;
  *             PD0 not brought out on TSSOP20; PD1 shared with SWIM
  *             kept free for debug)
  *   UART     PD5 TX / PD6 RX, 115200 8N1 debug output
- *   BEEP     PD4 (hardware BEEP peripheral, LSI clock, 1/2/4 kHz)
+ *   CTRL     PD4 (plain GPIO push-pull output, idle HIGH, LOW pulse on trigger)
  *
  * Display behaviour (internal precision = MILLIMETRES, display in cm):
  *   Every HCSR04_PERIOD_MS (100ms) the main loop starts a new
@@ -29,27 +29,22 @@
  *     - valid >= 1000mm (>= 1m)     -> "--" (out of display range)
  *     - invalid / no echo / timeout -> "--"
  *     - echo width < 134us (~2.3cm, inside the HC-SR04 acoustic blind
- *       zone) -> treated as invalid: "--", no beep
+ *       zone) -> treated as invalid: "--", no trigger
  *   The validity window is therefore ~2.3cm..~5m; the display range
  *   stops at 1m, and anything longer is shown as "--" exactly like an
  *   invalid reading.
- *   The result is printed over UART (the REAL echo width is always
- *   printed, e.g. "DIST=-- cm (OVR>=1m, us=25523)"); beep policy uses
- *   three escalating warning bands (50ms each, pitch AND cadence rising
- *   as the target approaches), so the distance can be judged by ear
- *   alone:
- *     - < HCSR04_CRIT_MM (20cm)  -> 4kHz ALARM: one beep per
- *       HCSR04_CRIT_BEEP_EVERY (2) accepted readings
- *       (200ms cadence, ~5Hz);
- *     - < HCSR04_NEAR_MM (50cm)  -> 2kHz: one beep per
- *       HCSR04_NEAR_BEEP_EVERY (4) accepted readings
- *       (400ms cadence, ~2.5Hz);
- *     - < HCSR04_FAR_MM (80cm)   -> 1kHz: one beep per
- *       HCSR04_FAR_BEEP_EVERY (6) accepted readings
- *       (600ms cadence, ~1.67Hz);
- *     - NO beep for >= 80cm, >= 1m, suppressed or rejected readings,
- *       and invalid / no echo. All three counters are cleared whenever a
- *       reading is >= 80cm or invalid.
+ *   The result is printed over UART as "SHOW <panel> | <mm>", tagged
+ *   OVR / NOECHO when the panel is showing "--".
+ *   Control output (PD4, replaces the old BEEP alarm): the pin idles
+ *   HIGH. When an accepted reading is closer than CTRL_TRIGGER_MM
+ *   (80cm) the pin is driven LOW for CTRL_PULSE_MS (200ms), released
+ *   back HIGH, and the sensor then stays SILENT for CTRL_SILENCE_MS
+ *   (8s): no new measurement is started and no further pulse can fire,
+ *   so one approach produces exactly one pulse. When the silence
+ *   expires the normal measurement cycle resumes and the detector is
+ *   armed again:
+ *     - >= 80cm, >= 1m, suppressed or rejected readings, and invalid /
+ *       no echo -> pin stays HIGH, nothing is triggered.
  *
  * Filter chain (CURRENTLY ACTIVE - see hcsr04_handle_done):
  *   Three stages used to be cascaded here: a median window, a 300mm
@@ -80,17 +75,16 @@
  *   original invalid line and reset the median window.
  *
  * Event loop: the TIM2 hard interrupt drives seg.onTime() dynamic scan
- * (1ms per digit, 2ms full refresh) and beep.update() (auto-off timed
- * beeps). The non-blocking HC-SR04 state machine runs from the main
- * loop (never inside an ISR) and never blocks the loop. UART1 RX
- * (IRQ 18) is serviced by the main loop (echo back only).
+ * (1ms per digit, 2ms full refresh). The control output (PD4) is timed
+ * from g_tick in the main loop, together with the non-blocking HC-SR04
+ * state machine, which never runs inside an ISR and never blocks the
+ * loop. UART1 RX (IRQ 18) is serviced by the main loop (echo back only).
  */
 
 #include <stdint.h>
 #include "hcsr04.h"
 #include "segled.h"
 #include "uart.h"
-#include "beep.h"
 
 /* ========== User Configuration ========== */
 
@@ -124,8 +118,8 @@
 
 /* Timebase self-check line ("TICK=... +5000"). Off: the log is now
  * change-driven only. Set to 1 when the 1ms cadence is in doubt - it is
- * the first thing to check if the display starts lagging or the beep
- * rhythm drifts. */
+ * the first thing to check if the display starts lagging or the pulse
+ * / silence timing drifts. */
 #define HCSR04_UART_TICK     0
 
 /* Retry policy (fix for ~50% of cycles returning us=0):
@@ -138,7 +132,7 @@
  * driven by g_tick, so retrying never blocks the main loop and the
  * sensor state machine keeps running normally. A successful attempt
  * ends the retries for that period; if all 3 attempts fail the result
- * is reported as invalid exactly like before ("--", no beep). */
+ * is reported as invalid exactly like before ("--", no trigger). */
 #define HCSR04_RETRY_MAX     2   /* up to 2 retries -> 3 attempts/period */
 #define HCSR04_RETRY_GAP_MS  20  /* idle gap between two attempts (ms) */
 
@@ -158,7 +152,7 @@
  *                                         keep the previous display value;
  *                                         the raw value is still printed over
  *                                         UART, marked "suppressed", but no
- *                                         beep is played.
+ *                                         trigger is fired.
  * Dead-man rule: after HCSR04_PENDING_MAX consecutive rejected cycles the
  * newest reading is adopted anyway, so a target that really moved to a
  * completely different distance cannot freeze the display on a stale
@@ -269,46 +263,32 @@
  * below HCSR04_JUMP_THRESHOLD_MM. */
 #define HCSR04_DISPLAY_HYST_MM       10  /* one display step (1cm) */
 
-/* ========== Display / Beep Range Limit ==========
+/* ========== Display Range Limit ==========
  * The panel only has 2 digits, so distances >= 1000mm (1m) cannot be
- * shown meaningfully: they are displayed as "--" and do not beep. The
- * sensor keeps measuring up to HCSR04_MAX_US (about 5m) and the real
- * echo width is still printed over UART for diagnostics. */
+ * shown meaningfully: they are displayed as "--" and never trigger the
+ * control output. The sensor keeps measuring up to HCSR04_MAX_US (about
+ * 5m) and the real echo width is still printed over UART. */
 #define DIST_DISPLAY_MAX_MM        1000  /* display range: < 1m only */
 
-/* ========== Near-Range Beep Escalation (three warning bands) ==========
- * The beeper has to tell a CONTINUOUS close-range alarm apart from a
- * plain proximity warning, without the operator looking at the panel.
- * Three bands are used now: the pitch rises AND the cadence quickens as
- * the target approaches, so tone and rhythm both carry the same message
- * (the BEEP hardware offers exactly 1 / 2 / 4 kHz, which maps cleanly
- * onto three bands):
- *   < HCSR04_CRIT_MM (20cm) -> HCSR04_CRIT_KHZ (4kHz), one beep every
- *      HCSR04_CRIT_BEEP_EVERY (2) accepted readings = 200ms / 5Hz:
- *      a fast, high-pitched chirp, unmistakable alarm;
- *   < HCSR04_NEAR_MM (50cm) -> HCSR04_NEAR_KHZ (2kHz), one beep every
- *      HCSR04_NEAR_BEEP_EVERY (4) accepted readings = 400ms / 2.5Hz;
- *   < HCSR04_FAR_MM (80cm)  -> HCSR04_FAR_KHZ (1kHz), one beep every
- *      HCSR04_FAR_BEEP_EVERY (6) accepted readings = 600ms / 1.67Hz;
- *   >= 80cm up to the 1m display limit -> silent (the display still
- *      shows the distance).
- * All beeps are 50ms, and every band is throttled by an accepted-reading
- * counter because the cycle period is 100ms - a beep on every cycle
- * would be 10Hz and the 50ms pulses would merge into a continuous softer
- * tone instead of a chirp.
- * Each band owns its own counter and the other two are cleared the
- * moment the reading enters a band, so a partial count can never spill
- * over into a later approach - and the 5Hz alarm cadence can never
- * inherit a half-filled 1.67Hz reminder counter. */
-#define HCSR04_CRIT_MM              200  /* < 20cm: urgent alarm band       */
-#define HCSR04_CRIT_BEEP_EVERY        2  /* beep per 2 reads -> 200ms / 5Hz */
-#define HCSR04_CRIT_KHZ               4  /* 4kHz: highest pitch             */
-#define HCSR04_NEAR_MM              500  /* < 50cm: warning band            */
-#define HCSR04_NEAR_BEEP_EVERY        4  /* beep per 4 reads -> 400ms/2.5Hz */
-#define HCSR04_NEAR_KHZ               2  /* 2kHz                            */
-#define HCSR04_FAR_MM               800  /* < 80cm: reminder band           */
-#define HCSR04_FAR_BEEP_EVERY         6  /* beep per 6 reads -> 600ms/1.67Hz*/
-#define HCSR04_FAR_KHZ                1  /* 1kHz: lowest, gentlest          */
+/* ========== Control Output (replaces the BEEP alarm) ==========
+ * The hardware BEEP peripheral is no longer used at all. PD4 is now a
+ * plain push-pull GPIO output (BEEPEN stays 0 in its reset state, so the
+ * alternate function never takes the pin over) and drives an external
+ * device:
+ *   - init / power-up      -> pin driven HIGH (idle, "nothing detected");
+ *   - accepted reading < CTRL_TRIGGER_MM (80cm) -> pin LOW, ONCE;
+ *   - after CTRL_PULSE_MS (200ms) the pin returns HIGH and the sensor
+ *     then stays quiet for CTRL_SILENCE_MS (8s): no measurement is
+ *     started and no further pulse can fire in that window;
+ *   - when the silence expires the normal 100ms cycle resumes and the
+ *     detector is armed again.
+ * The trigger test uses the value the panel shows (median -> mean ->
+ * 5mm rounding), so a single spike can never fire the output. Both the
+ * pulse width and the silence window are timed from g_tick, i.e. they
+ * never block the main loop and keep running while the loop is in wfi. */
+#define CTRL_TRIGGER_MM      800  /* < 80cm: one LOW pulse            */
+#define CTRL_PULSE_MS        200  /* LOW pulse width (ms)             */
+#define CTRL_SILENCE_MS     8000  /* quiet time after the pulse (ms)  */
 
 /* ========== STM8S103 Register Definitions ========== */
 
@@ -326,13 +306,78 @@ static void clock_setup(void)
 static SEGLED_t   seg;                    /* 2-digit common-anode 7-seg */
 static HCSR04_t   hcsr04;                 /* ultrasonic sensor PB5/PB4 */
 static UART_t     uart;                   /* UART1 debug link (PD5/PD6) */
-static Beep_t     beep;                   /* hardware BEEP on PD4 */
 
 /* Global 1ms tick, incremented by the TIM2 ISR.
  * SCOPE: scheduling only - measurement period, retry gap, UART cadence.
  * It is NOT part of any distance computation: the echo width is timed
  * purely from the TIM1 CNTR snapshots (see hcsr04.c). */
 volatile uint16_t g_tick = 0;
+
+/* ========== Control Output (PD4) State ==========
+ * Three phases, all timed from g_tick (1ms), so neither the pulse nor the
+ * silence window blocks the main loop:
+ *   CTRL_IDLE    -> pin HIGH, HC-SR04 measuring normally
+ *   CTRL_PULSE   -> pin LOW, pulse width counting down
+ *   CTRL_SILENCE -> pin HIGH, measurement suspended (re-armed on exit)
+ * The port registers are written directly and only bit 4 is touched, so
+ * the display digit selects (PD2/PD3) and the UART pins (PD5/PD6) keep
+ * exactly the configuration their own drivers gave them. */
+#define GPIO_PD_BASE   0x500F
+#define PD_ODR   (*(volatile uint8_t *)(GPIO_PD_BASE + 0))
+#define PD_DDR   (*(volatile uint8_t *)(GPIO_PD_BASE + 2))
+#define PD_CR1   (*(volatile uint8_t *)(GPIO_PD_BASE + 3))
+#define PD_CR2   (*(volatile uint8_t *)(GPIO_PD_BASE + 4))
+#define PD4_MASK 0x10
+
+#define CTRL_IDLE      0
+#define CTRL_PULSE     1
+#define CTRL_SILENCE   2
+
+static uint8_t  ctrl_state = CTRL_IDLE;
+static uint16_t ctrl_tick  = 0;   /* g_tick at the start of the phase */
+
+static void ctrl_init(void)
+{
+    /* Latch the idle level BEFORE the pin becomes an output, so the
+     * external device never sees a spurious LOW at power-up. */
+    PD_ODR |= PD4_MASK;
+    PD_DDR |= PD4_MASK;              /* push-pull output */
+    PD_CR1 |= PD4_MASK;
+    PD_CR2 &= (uint8_t)~PD4_MASK;    /* no external interrupt */
+    ctrl_state = CTRL_IDLE;
+    ctrl_tick  = 0;
+}
+
+/* Fire one pulse. Called from hcsr04_handle_done() for an accepted
+ * reading closer than CTRL_TRIGGER_MM. Refused while a pulse or the
+ * following silence is still running, so one approach cannot produce a
+ * second pulse. */
+static void ctrl_trigger(void)
+{
+    if (ctrl_state != CTRL_IDLE) {
+        return;
+    }
+    PD_ODR &= (uint8_t)~PD4_MASK;    /* LOW: drive the external device */
+    ctrl_tick  = g_tick;
+    ctrl_state = CTRL_PULSE;
+}
+
+/* Advance the pulse / silence phases. Called once per main-loop pass;
+ * g_tick keeps counting even while the loop sleeps in wfi. */
+static void ctrl_service(void)
+{
+    if (ctrl_state == CTRL_PULSE) {
+        if ((uint16_t)(g_tick - ctrl_tick) >= CTRL_PULSE_MS) {
+            PD_ODR |= PD4_MASK;      /* pulse over: back to idle HIGH */
+            ctrl_tick  = g_tick;
+            ctrl_state = CTRL_SILENCE;
+        }
+    } else if (ctrl_state == CTRL_SILENCE) {
+        if ((uint16_t)(g_tick - ctrl_tick) >= CTRL_SILENCE_MS) {
+            ctrl_state = CTRL_IDLE;  /* armed again: measuring resumes */
+        }
+    }
+}
 
 /* ---- TEMP DIAG: display-scan timing probe (remove after diagnosis) ----
  * TIM1 is a free-running 1us timebase, so its counter gives a cheap
@@ -382,7 +427,7 @@ static   uint16_t s_diag_report  = 0u;
 #define TIM1_ARRH   (*(volatile uint8_t *)0x5262)
 #define TIM1_ARRL   (*(volatile uint8_t *)0x5263)
 
-/* ========== TIM2: 1ms Time-Slice Timer (display scan / BEEP / g_tick) ========== */
+/* ========== TIM2: 1ms Time-Slice Timer (display scan / g_tick) ========== */
 
 /* WARNING: TIM2's register map is NOT the same as TIM1's. TIM2 has no ETR
  * register and only CCMR1..CCMR3 (TIM1 has ETR + CCMR1..CCMR4), so every
@@ -445,7 +490,7 @@ static void tim2_setup(void)
 /* ========== TIM2 Update ISR ==========
  * STM8S103F3 TIM2_UPD_OVF_BRK -> SDCC __interrupt(13).
  * Drives the non-blocking 1ms time slices:
- *   1ms dynamic scan of the 2-digit display + BEEP auto-off update.
+ *   1ms dynamic scan of the 2-digit display.
  *   g_tick is the global 1ms counter used for scheduling only. */
 void TIM2_UPD_OVF_BRK_IRQHandler(void) __interrupt(13)
 {
@@ -467,8 +512,6 @@ void TIM2_UPD_OVF_BRK_IRQHandler(void) __interrupt(13)
     /* 1ms dynamic scan: one digit lit per call, full refresh every 2ms. */
     seg.onTime(&seg, g_tick);
 
-    /* 1ms tick for the BEEP module (auto-off timed beeps). */
-    beep.update(&beep);
 
     /* ---- TEMP DIAG: ISR body duration ---- */
     d_t1 = diag_cntr();
@@ -537,7 +580,8 @@ static uint8_t  pending_rejects = 0;   /* consecutive rejected cycles */
  * Returns 1 and writes the value to show into *out_mm when the reading
  * is accepted (fresh value, confirmed move or dead-man override);
  * returns 0 when the reading is an unconfirmed jump, in which case the
- * display keeps its previous value and nothing is beeped. */
+ * display keeps its previous value and the control output is not
+ * triggered. */
 static uint8_t dist_filter(uint16_t d, uint16_t *out_mm)
 {
     uint16_t diff;
@@ -778,22 +822,13 @@ static uint8_t display_update(uint16_t v)
 /* ========== Handle One Finished HC-SR04 Cycle ==========
  * Called from the main loop exactly once when service() returns
  * HCSR04_DONE. Updates the display, prints the result over UART and
- * plays the configured beep in one of three escalating bands. All bands
- * count ACCEPTED readings, because one cycle is only 100ms:
- *   alarm      -> accepted reading < 20cm (HCSR04_CRIT_MM): 4kHz, one
- *                 beep every HCSR04_CRIT_BEEP_EVERY (2) accepted
- *                 readings, i.e. 200ms / 5Hz; the lower-band counters are
- *                 pinned to 0, so a retreat into the 20-50cm band starts
- *                 counting from scratch
- *   warning    -> accepted reading < 50cm (HCSR04_NEAR_MM): 2kHz, one
- *                 beep every HCSR04_NEAR_BEEP_EVERY (4) accepted
- *                 readings, counter then restarts from 0 (400ms/2.5Hz)
- *   reminder   -> accepted reading < 80cm (HCSR04_FAR_MM): 1kHz, one
- *                 beep every HCSR04_FAR_BEEP_EVERY (6) accepted
- *                 readings, counter then restarts from 0 (600ms/1.67Hz)
- *   (no beep)  -> >= 80cm, >= 1m, suppressed / rejected readings,
- *                 invalid or no echo (all three counters cleared on
- *                 >= 80cm and on invalid samples) */
+ * fires the control output when the target is close:
+ *   trigger    -> accepted reading < CTRL_TRIGGER_MM (80cm): PD4 goes
+ *                 LOW for CTRL_PULSE_MS (200ms), the sensor is then
+ *                 silent for CTRL_SILENCE_MS (8s) and re-armed after
+ *                 that. One approach = one pulse.
+ *   (no pulse) -> >= 80cm, >= 1m, suppressed / rejected readings,
+ *                 invalid or no echo: the pin stays HIGH. */
 static void hcsr04_handle_done(void)
 {
     /* NOTE: the raw echo width (hcsr04.last_echo_us) is deliberately NOT
@@ -801,11 +836,6 @@ static void hcsr04_handle_done(void)
      * the internal mm value. Re-add a local for it if a per-sample us
      * trace is ever needed again (it must stay 16-bit safe: bounded by
      * the 40ms WAIT_LOW timeout, < 65536). */
-    /* Beep throttle counters, one per warning band: only meaningful for
-     * accepted readings inside the display range. Held across calls. */
-    static uint8_t far_beep_cnt = 0;
-    static uint8_t near_beep_cnt = 0;
-    static uint8_t crit_beep_cnt = 0;
     /* UART log divider: 0 = this cycle prints, see HCSR04_UART_EVERY_N. */
     static uint8_t uart_div = 0;
     uint8_t do_print;
@@ -845,9 +875,6 @@ static void hcsr04_handle_done(void)
                 log_blank("OVR");       /* one line per entry into "--" */
                 printed_mm = 0xFFFE;
             }
-            far_beep_cnt = 0;           /* >= 1m: silent, drop all counters */
-            near_beep_cnt = 0;
-            crit_beep_cnt = 0;
             dist_filter_reset();
             median_reset();
             mean_reset();
@@ -899,55 +926,14 @@ static void hcsr04_handle_done(void)
             }
         }
 
-        /* Beep policy keyed on the value the panel actually shows, so
-         * the beep and the display always agree. One cycle is 100ms, so
-         * ALL THREE bands are throttled by their own counter (a beep on
-         * every cycle would be 10Hz and the 50ms pulses would merge into
-         * a continuous tone). Pitch and cadence both escalate:
-         *   <  HCSR04_CRIT_MM (20cm) -> 4kHz ALARM, one beep per
-         *      HCSR04_CRIT_BEEP_EVERY (2) readings = 200ms / 5Hz. The
-         *      two lower counters are pinned to 0 so a retreat into the
-         *      20-50cm band restarts from scratch;
-         *   <  HCSR04_NEAR_MM (50cm) -> 2kHz warning, one beep per
-         *      HCSR04_NEAR_BEEP_EVERY (4) readings = 400ms / 2.5Hz;
-         *   <  HCSR04_FAR_MM (80cm) -> 1kHz reminder, one beep per
-         *      HCSR04_FAR_BEEP_EVERY (6) readings = 600ms / 1.67Hz;
-         *   >= HCSR04_FAR_MM (80cm) -> never beeps, all counters are
-         *      cleared so a later close approach starts from 0. */
-        if (shown_mm < HCSR04_CRIT_MM) {
-            near_beep_cnt = 0;          /* pin: alarm has priority */
-            far_beep_cnt  = 0;
-            if (crit_beep_cnt < HCSR04_CRIT_BEEP_EVERY) {
-                crit_beep_cnt++;
-            }
-            if (crit_beep_cnt >= HCSR04_CRIT_BEEP_EVERY) {
-                crit_beep_cnt = 0;
-                beep.once(&beep, HCSR04_CRIT_KHZ, 50);
-            }
-        } else if (shown_mm < HCSR04_NEAR_MM) {
-            crit_beep_cnt = 0;
-            far_beep_cnt  = 0;
-            if (near_beep_cnt < HCSR04_NEAR_BEEP_EVERY) {
-                near_beep_cnt++;
-            }
-            if (near_beep_cnt >= HCSR04_NEAR_BEEP_EVERY) {
-                near_beep_cnt = 0;
-                beep.once(&beep, HCSR04_NEAR_KHZ, 50);
-            }
-        } else if (shown_mm < HCSR04_FAR_MM) {
-            crit_beep_cnt = 0;
-            near_beep_cnt = 0;
-            if (far_beep_cnt < HCSR04_FAR_BEEP_EVERY) {
-                far_beep_cnt++;
-            }
-            if (far_beep_cnt >= HCSR04_FAR_BEEP_EVERY) {
-                far_beep_cnt = 0;
-                beep.once(&beep, HCSR04_FAR_KHZ, 50);
-            }
-        } else {
-            far_beep_cnt  = 0;      /* >= 80cm: silent */
-            near_beep_cnt = 0;
-            crit_beep_cnt = 0;
+        /* Control output, keyed on the value the panel actually shows,
+         * so the pulse and the display always agree: a spike the
+         * median/mean chain already rejected can never fire it. Only an
+         * in-range reading can trigger, and ctrl_trigger() refuses while
+         * a pulse or the following 8s silence is running - one approach
+         * yields exactly one pulse. */
+        if (shown_mm < CTRL_TRIGGER_MM) {
+            ctrl_trigger();
         }
     } else {
         seg_show_distance(0xFFFF);        /* "--" (invalid) */
@@ -955,13 +941,10 @@ static void hcsr04_handle_done(void)
             log_blank("NOECHO");          /* one line per entry into "--" */
             printed_mm = 0xFFFE;
         }
-        /* invalid / no echo: do NOT beep, and drop ALL THREE band counters
-         * so a stale partial count can never trigger later.
-         * The median window and the panel value are dropped too, so a
-         * long drop-out cannot drag the next real reading around. */
-        far_beep_cnt  = 0;
-        near_beep_cnt = 0;
-        crit_beep_cnt = 0;
+        /* invalid / no echo: no trigger. The control pin is left alone
+         * (it stays HIGH unless a pulse is already in flight).
+         * The median window and the panel value are dropped as well,
+         * so a long drop-out cannot drag the next real reading. */
         median_reset();
         mean_reset();
         have_shown = 0;
@@ -1025,7 +1008,6 @@ int main(void)
     hcsr04 = HCSR04_Create();   /* Trig=PB5, Echo=PB4 */
     hcsr04.blank_cb = seg_blank_all;    /* blank digits during masked capture */
     uart   = UART_Create(UART1_BASE);
-    beep   = BEEP_Create();     /* hardware BEEP on PD4 */
 
     clock_setup();              /* HSI 16MHz */
 
@@ -1033,10 +1015,10 @@ int main(void)
     uart.init(&uart);           /* UART1 115200 8N1, TX PD5 / RX PD6 */
     seg.init(&seg);             /* 10 GPIO outputs for 2x7-seg (common-anode) */
     hcsr04.init(&hcsr04);       /* PB5=Trig out (open-drain+10k pull), PB4=Echo in */
-    beep.init(&beep);           /* LSI + PD4 BEEP output, idle off */
+    ctrl_init();                /* PD4 push-pull output, idle HIGH */
 
     tim1_setup();               /* TIM1: free-running 1us timebase, no IRQ */
-    tim2_setup();               /* TIM2: 1ms slice (scan/BEEP/g_tick) */
+    tim2_setup();               /* TIM2: 1ms slice (scan/g_tick) */
     __asm__("rim");             /* enable global interrupts */
 
     /* Show "--" until the first measurement completes. */
@@ -1054,6 +1036,8 @@ int main(void)
     uart.tx_service(&uart);
     uart.puts(&uart, "Log: one line per >=5mm change: SHOW <panel> | <mm>\r\n");
     uart.tx_service(&uart);
+    uart.puts(&uart, "Ctrl: PD4 idle high, <80cm -> low 200ms, silence 8s\r\n");
+    uart.tx_service(&uart);
 
     /* Event-driven main loop.
      * NOTE: 不能�?halt（外设中断无法唤�?halt）；�?wfi：CPU 暂停但外�?     * 时钟继续，任何中断（�?TIM2 1ms / UART1 RX）唤醒后自动进入 ISR�?*/
@@ -1061,6 +1045,10 @@ int main(void)
         /* Drain pending TX bytes so startup / previous results reach
          * the console promptly. */
         uart.tx_service(&uart);
+
+        /* Control output phases: release the pulse after 200ms and
+         * re-arm the detector once the 8s silence has elapsed. */
+        ctrl_service();
 
         /* UART RX: echo back only (display is HC-SR04 driven now). */
         if (uart.rx_flag) {
@@ -1078,7 +1066,7 @@ int main(void)
          * later, so a transient missed trigger does not reach the
          * display. Only when all HCSR04_RETRY_MAX+1 attempts of the
          * period have failed is the result handled the old way
-         * ("--" + no beep). */
+         * ("--" + no trigger). */
         if (hcsr04.service(&hcsr04) == HCSR04_DONE) {
             if (!done_handled) {
                 done_handled = 1;
@@ -1106,8 +1094,11 @@ int main(void)
 
         /* Start a new measurement every HCSR04_PERIOD_MS (100ms),
          * stretched up to 4x while no echo is coming back (idle_backoff).
+         * Suspended entirely during the 8s silence window after a
+         * trigger, so the sensor really is quiet then.
          * A new period also resets the retry budget. */
-        if ((uint16_t)(g_tick - last_measure_tick) >=
+        if (ctrl_state == CTRL_IDLE &&
+            (uint16_t)(g_tick - last_measure_tick) >=
             (uint16_t)(HCSR04_PERIOD_MS << idle_backoff)) {
             last_measure_tick = g_tick;
             retry_count = 0;

@@ -14,12 +14,10 @@ set SRC1=main.c
 set SRC2=hcsr04.c
 set SRC3=segled.c
 set SRC4=uart.c
-set SRC5=beep.c
 set REL1=main.rel
 set REL2=hcsr04.rel
 set REL3=segled.rel
 set REL4=uart.rel
-set REL5=beep.rel
 set OUTPUT=%PROJECT%.ihx
 
 echo.
@@ -42,7 +40,7 @@ sdcc --version 2>&1 | findstr /C:"SDCC"
 echo.
 
 REM --- Check if source files exist ---
-for %%F in ("%SRC1%" "%SRC2%" "%SRC3%" "%SRC4%" "%SRC5%") do (
+for %%F in ("%SRC1%" "%SRC2%" "%SRC3%" "%SRC4%") do (
     if not exist %%~F (
         echo [ERROR] Source file '%%~nxF' not found.
         pause
@@ -50,11 +48,11 @@ for %%F in ("%SRC1%" "%SRC2%" "%SRC3%" "%SRC4%" "%SRC5%") do (
     )
 )
 
-echo [INFO] Sources: %SRC1%  %SRC2%  %SRC3%  %SRC4%  %SRC5%
+echo [INFO] Sources: %SRC1%  %SRC2%  %SRC3%  %SRC4%
 echo.
 
 REM ====== Compile ======
-for %%S in (%SRC1% %SRC2% %SRC3% %SRC4% %SRC5%) do (
+for %%S in (%SRC1% %SRC2% %SRC3% %SRC4%) do (
     echo [STEP] Compiling %%S...
     REM --std-c99 is REQUIRED: without it SDCC's va_arg handling for the
     REM variadic uart_printf() misreads promoted arguments -> garbled UART
@@ -68,7 +66,7 @@ for %%S in (%SRC1% %SRC2% %SRC3% %SRC4% %SRC5%) do (
 )
 
 echo [STEP] Linking...
-sdcc -mstm8 --std-c99 %REL1% %REL2% %REL3% %REL4% %REL5% -o "%OUTPUT%"
+sdcc -mstm8 --std-c99 %REL1% %REL2% %REL3% %REL4% -o "%OUTPUT%"
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
@@ -100,7 +98,7 @@ REM ====== Clean up intermediate files ======
 echo [STEP] Cleaning intermediate files...
 for %%x in (asm lst rst rel sym map lk mem) do (
     if exist "%PROJECT%.%%x"  del "%PROJECT%.%%x"
-    for %%S in (main hcsr04 segled uart beep) do (
+    for %%S in (main hcsr04 segled uart) do (
         if exist "%%S.%%x" del "%%S.%%x"
     )
 )

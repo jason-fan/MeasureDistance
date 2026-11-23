@@ -13,7 +13,7 @@ MCU      = stm8s103f3
 PROJECT  = project5
 
 # Source files
-SRCS     = main.c hcsr04.c segled.c uart.c beep.c
+SRCS     = main.c hcsr04.c segled.c uart.c
 
 # Compiler flags
 CFLAGS   = -mstm8 --std-c99 -I./
@@ -37,8 +37,7 @@ $(IHX): $(SRCS)
 	$(CC) $(CFLAGS) -c hcsr04.c
 	$(CC) $(CFLAGS) -c segled.c
 	$(CC) $(CFLAGS) -c uart.c
-	$(CC) $(CFLAGS) -c beep.c
-	$(CC) $(CFLAGS) main.rel hcsr04.rel segled.rel uart.rel beep.rel -o $@
+	$(CC) $(CFLAGS) main.rel hcsr04.rel segled.rel uart.rel -o $@
 
 # Show memory usage
 size: $(IHX)
