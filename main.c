@@ -38,11 +38,11 @@
  *   Control output (PD4, replaces the old BEEP alarm): the pin idles
  *   HIGH. When an accepted reading is closer than CTRL_TRIGGER_MM
  *   (80cm) the pin is driven LOW for CTRL_PULSE_MS (200ms), released
- *   back HIGH, and the sensor then stays SILENT for CTRL_SILENCE_MS
- *   (8s): no new measurement is started and no further pulse can fire,
- *   so one approach produces exactly one pulse. When the silence
- *   expires the normal measurement cycle resumes and the detector is
- *   armed again:
+ *   back HIGH, and further pulses are then blocked for CTRL_SILENCE_MS
+ *   (8s), so one approach produces exactly one pulse. Measuring, the
+ *   panel and the UART log are NOT suspended by that window: the board
+ *   keeps displaying normally so it never looks dead. When the silence
+ *   expires the detector is armed again:
  *     - >= 80cm, >= 1m, suppressed or rejected readings, and invalid /
  *       no echo -> pin stays HIGH, nothing is triggered.
  *
@@ -277,11 +277,12 @@
  * device:
  *   - init / power-up      -> pin driven HIGH (idle, "nothing detected");
  *   - accepted reading < CTRL_TRIGGER_MM (80cm) -> pin LOW, ONCE;
- *   - after CTRL_PULSE_MS (200ms) the pin returns HIGH and the sensor
- *     then stays quiet for CTRL_SILENCE_MS (8s): no measurement is
- *     started and no further pulse can fire in that window;
- *   - when the silence expires the normal 100ms cycle resumes and the
- *     detector is armed again.
+ *   - after CTRL_PULSE_MS (200ms) the pin returns HIGH and no further
+ *     pulse can fire for CTRL_SILENCE_MS (8s). Measurement, display and
+ *     the UART log keep running through that window - only the output is
+ *     muted, so panel / console never freeze;
+ *   - when the silence expires the detector is armed again (the 100ms
+ *     measurement cycle is never interrupted).
  * The trigger test uses the value the panel shows (median -> mean ->
  * 5mm rounding), so a single spike can never fire the output. Both the
  * pulse width and the silence window are timed from g_tick, i.e. they
@@ -316,9 +317,12 @@ volatile uint16_t g_tick = 0;
 /* ========== Control Output (PD4) State ==========
  * Three phases, all timed from g_tick (1ms), so neither the pulse nor the
  * silence window blocks the main loop:
- *   CTRL_IDLE    -> pin HIGH, HC-SR04 measuring normally
+ *   CTRL_IDLE    -> pin HIGH, a close reading may fire the output
  *   CTRL_PULSE   -> pin LOW, pulse width counting down
- *   CTRL_SILENCE -> pin HIGH, measurement suspended (re-armed on exit)
+ *   CTRL_SILENCE -> pin HIGH, new pulses refused (re-armed on exit)
+ * Measurement, display and UART are intentionally NOT gated by this
+ * state machine: only the PD4 output is, so the board keeps showing the
+ * live distance during the 8s window instead of looking hung.
  * The port registers are written directly and only bit 4 is touched, so
  * the display digit selects (PD2/PD3) and the UART pins (PD5/PD6) keep
  * exactly the configuration their own drivers gave them. */
@@ -374,7 +378,7 @@ static void ctrl_service(void)
         }
     } else if (ctrl_state == CTRL_SILENCE) {
         if ((uint16_t)(g_tick - ctrl_tick) >= CTRL_SILENCE_MS) {
-            ctrl_state = CTRL_IDLE;  /* armed again: measuring resumes */
+            ctrl_state = CTRL_IDLE;  /* armed again: pulses allowed */
         }
     }
 }
@@ -520,7 +524,7 @@ void TIM2_UPD_OVF_BRK_IRQHandler(void) __interrupt(13)
 }
 
 /* ========== UART1 RX ISR Stub (must live in the main unit!) ==========
- * SDCC 4.5.0 stm8 后端只在"�?main 的编译单�?生成 __interrupt_vect 向量表�? * UART1_RX vector = 0x8050 (IRQ 18) -> __interrupt(18)�? * 向量壳放在本文件，实际处理委托给 uart 模块�?uart_rx_irq_handler()�? */
+ * SDCC 4.5.0 stm8 后端只在"�?main 的编译单�?生成 __interrupt_vect 向量表�? * UART1_RX vector = 0x8050 (IRQ 18) -> __interrupt(18)�? * 向量壳放在本文件，实际处理委托给 uart 模块�?uart_rx_irq_handler()�? */
 void UART1_RX_IRQHandler(void) __interrupt(18)
 {
     uart_rx_irq_handler();
@@ -824,9 +828,9 @@ static uint8_t display_update(uint16_t v)
  * HCSR04_DONE. Updates the display, prints the result over UART and
  * fires the control output when the target is close:
  *   trigger    -> accepted reading < CTRL_TRIGGER_MM (80cm): PD4 goes
- *                 LOW for CTRL_PULSE_MS (200ms), the sensor is then
- *                 silent for CTRL_SILENCE_MS (8s) and re-armed after
- *                 that. One approach = one pulse.
+ *                 LOW for CTRL_PULSE_MS (200ms), then no pulse may fire
+ *                 for CTRL_SILENCE_MS (8s). Display / UART keep updating
+ *                 throughout. One approach = one pulse.
  *   (no pulse) -> >= 80cm, >= 1m, suppressed / rejected readings,
  *                 invalid or no echo: the pin stays HIGH. */
 static void hcsr04_handle_done(void)
@@ -1040,7 +1044,7 @@ int main(void)
     uart.tx_service(&uart);
 
     /* Event-driven main loop.
-     * NOTE: 不能�?halt（外设中断无法唤�?halt）；�?wfi：CPU 暂停但外�?     * 时钟继续，任何中断（�?TIM2 1ms / UART1 RX）唤醒后自动进入 ISR�?*/
+     * NOTE: 不能�?halt（外设中断无法唤�?halt）；�?wfi：CPU 暂停但外�?     * 时钟继续，任何中断（�?TIM2 1ms / UART1 RX）唤醒后自动进入 ISR�?*/
     while (1) {
         /* Drain pending TX bytes so startup / previous results reach
          * the console promptly. */
@@ -1094,11 +1098,11 @@ int main(void)
 
         /* Start a new measurement every HCSR04_PERIOD_MS (100ms),
          * stretched up to 4x while no echo is coming back (idle_backoff).
-         * Suspended entirely during the 8s silence window after a
-         * trigger, so the sensor really is quiet then.
+         * NOT suspended by the control-output silence window: measuring
+         * and the panel must keep running, otherwise 8s of mute output
+         * looks like a hang. Only ctrl_trigger() is blocked there.
          * A new period also resets the retry budget. */
-        if (ctrl_state == CTRL_IDLE &&
-            (uint16_t)(g_tick - last_measure_tick) >=
+        if ((uint16_t)(g_tick - last_measure_tick) >=
             (uint16_t)(HCSR04_PERIOD_MS << idle_backoff)) {
             last_measure_tick = g_tick;
             retry_count = 0;
@@ -1154,9 +1158,9 @@ int main(void)
         uart.tx_service(&uart);     /* drain TX after the measurement */
 
         /* Low-power wait: ONLY when no measurement is in flight.
-         * 无条�?wfi 会把 service() 的推进节拍锁死在 1ms 中断上，Echo �?         * 上升�?/ 下降沿都要等到下一�?wfi 唤醒才被采样，两次边沿的采样
-         * 延迟各差最�?1ms，测出的宽度就带�?±1000us（≈ ±17cm）误差�?         * 时基本身已是�?CNTR�?us 分辨率），误差不来自计数精度而来�?         * 边沿采样延迟，因此测量窗口内仍需全速轮询�?         * 因此测量进行中（WAIT_IDLE / WAIT_HIGH / WAIT_LOW）必须全�?         * 轮询，才能采到真实的微秒级边沿时刻；只有 IDLE（等下一�?100ms
-         * start）和 DONE（结果已就绪、等�?start 复用）才允许 wfi 省电�?*/
+         * 无条�?wfi 会把 service() 的推进节拍锁死在 1ms 中断上，Echo �?         * 上升�?/ 下降沿都要等到下一�?wfi 唤醒才被采样，两次边沿的采样
+         * 延迟各差最�?1ms，测出的宽度就带�?±1000us（≈ ±17cm）误差�?         * 时基本身已是�?CNTR�?us 分辨率），误差不来自计数精度而来�?         * 边沿采样延迟，因此测量窗口内仍需全速轮询�?         * 因此测量进行中（WAIT_IDLE / WAIT_HIGH / WAIT_LOW）必须全�?         * 轮询，才能采到真实的微秒级边沿时刻；只有 IDLE（等下一�?100ms
+         * start）和 DONE（结果已就绪、等�?start 复用）才允许 wfi 省电�?*/
         if (hcsr04.state == HCSR04_STATE_IDLE ||
             hcsr04.state == HCSR04_STATE_DONE) {
             __asm__("wfi");         /* idle/done: sleep until next IRQ */
